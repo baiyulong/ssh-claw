@@ -5,6 +5,7 @@ mod ssh;
 mod ui;
 
 use std::io;
+use std::time::Duration;
 
 use clap::Parser;
 use crossterm::{
@@ -14,7 +15,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::App;
+use app::{App, Screen};
 
 #[derive(Parser)]
 #[command(name = "term-ssh-manager", about = "TUI SSH Connection Manager")]
@@ -42,7 +43,6 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        // Best-effort terminal restore on panic
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original_hook(panic_info);
@@ -61,44 +61,44 @@ fn main() -> io::Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if let Event::Key(key) = event::read()? {
-            // Ignore key release events on Windows
-            if key.kind != crossterm::event::KeyEventKind::Press {
-                continue;
-            }
-            input::handle_key(&mut app, key);
-        }
-
-        // Check if we need to launch SSH
-        if let Some(idx) = app.should_ssh.take() {
-            if let Some(server) = app.servers.get(idx).cloned() {
-                // Restore terminal for SSH
-                restore_terminal(&mut terminal)?;
-
-                eprintln!("Connecting to {} ...\n", server.display_connection());
-                let status = ssh::run_ssh(&server);
-
-                match status {
-                    Ok(s) if s.success() => {
-                        eprintln!("\nSSH session ended successfully.");
-                    }
-                    Ok(s) => {
-                        eprintln!("\nSSH exited with: {}", s);
-                    }
-                    Err(e) => {
-                        eprintln!("\nFailed to launch ssh: {}", e);
+        // Poll with a short timeout so we can check SSH exit between frames
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        input::handle_key(&mut app, key);
                     }
                 }
-
-                eprintln!("Press any key to return to the manager...");
-                // Wait for a keypress before re-entering TUI
-                enable_raw_mode()?;
-                let _ = event::read();
-                disable_raw_mode()?;
-
-                // Re-setup terminal
-                terminal = setup_terminal()?;
+                // Let ratatui handle resize automatically on next draw
+                Event::Resize(_, _) => {}
+                _ => {}
             }
+        }
+
+        // Spawn an embedded SSH session when requested
+        if let Some(idx) = app.should_ssh.take() {
+            if let Some(server) = app.servers.get(idx).cloned() {
+                let size = terminal.size()?;
+                match ssh::spawn_ssh(&server, size.height, size.width) {
+                    Ok(session) => {
+                        app.status_msg = format!("Connected → {}", server.display_connection());
+                        app.screen = Screen::SshSession(session);
+                    }
+                    Err(e) => {
+                        app.status_msg = format!("SSH error: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Return to dashboard when SSH session ends
+        let ssh_ended = match &app.screen {
+            Screen::SshSession(s) => s.is_exited(),
+            _ => false,
+        };
+        if ssh_ended {
+            app.screen = Screen::Dashboard;
+            app.status_msg = "SSH session ended.".to_string();
         }
 
         if app.should_quit {
@@ -109,3 +109,4 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
+

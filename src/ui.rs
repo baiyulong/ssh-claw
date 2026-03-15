@@ -7,13 +7,20 @@ use ratatui::{
 };
 
 use crate::app::{App, Screen, FORM_FIELDS};
+use crate::ssh::SshSession;
 
 pub fn draw(f: &mut Frame, app: &App) {
+    // SSH session takes over the entire frame — no chrome
+    if let Screen::SshSession(session) = &app.screen {
+        draw_ssh_session(f, session);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(5),   // main
+            Constraint::Min(5),    // main
             Constraint::Length(3), // status
         ])
         .split(f.area());
@@ -27,9 +34,99 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::AddForm => draw_form(f, app, "Add Server"),
         Screen::EditForm(_) => draw_form(f, app, "Edit Server"),
         Screen::ConfirmDelete(idx) => draw_confirm_delete(f, app, *idx),
-        Screen::Dashboard => {}
+        Screen::Dashboard | Screen::SshSession(_) => {}
     }
 }
+
+/// Render the vt100 terminal grid, cell by cell, grouping spans by style.
+fn draw_ssh_session(f: &mut Frame, session: &SshSession) {
+    let area = f.area();
+    let parser = session.parser.lock().unwrap();
+    let screen = parser.screen();
+
+    let (rows, cols) = screen.size();
+    let rows = rows as usize;
+    let cols = cols as usize;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+
+    for row in 0..rows {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run = String::new();
+        let mut run_style = Style::default();
+
+        for col in 0..cols {
+            let (content, style) = match screen.cell(row as u16, col as u16) {
+                Some(cell) => {
+                    // Skip the right half of wide chars — the parent cell covers them
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    let s = cell_style(cell);
+                    let c = if cell.has_contents() {
+                        cell.contents()
+                    } else {
+                        " ".to_string()
+                    };
+                    (c, s)
+                }
+                None => (" ".to_string(), Style::default()),
+            };
+
+            if style == run_style {
+                run.push_str(&content);
+            } else {
+                if !run.is_empty() {
+                    spans.push(Span::styled(run.clone(), run_style));
+                    run.clear();
+                }
+                run = content;
+                run_style = style;
+            }
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+
+    // Position cursor
+    if !screen.hide_cursor() {
+        let (crow, ccol) = screen.cursor_position();
+        let x = area.x + ccol;
+        let y = area.y + crow;
+        if x < area.x + area.width && y < area.y + area.height {
+            f.set_cursor_position((x, y));
+        }
+    }
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default()
+        .fg(vt_color(cell.fgcolor()))
+        .bg(vt_color(cell.bgcolor()));
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+fn vt_color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
 
 fn draw_header(f: &mut Frame, area: Rect) {
     let text = Line::from(vec![

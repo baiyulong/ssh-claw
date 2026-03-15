@@ -2,12 +2,13 @@ use crate::server::Server;
 use std::path::PathBuf;
 
 /// Which screen the app is on
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum Screen {
     Dashboard,
     AddForm,
     EditForm(usize),
     ConfirmDelete(usize),
+    SshSession(crate::ssh::SshSession),
 }
 
 /// Which field is focused in the form
