@@ -5,23 +5,25 @@ use std::sync::{
 };
 use std::thread;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::server::Server;
 
-/// Wraps `Box<dyn MasterPty>` to make it Send.
-/// Safety: all concrete MasterPty implementations (Unix/Windows) are Send.
-struct SendableMaster(Box<dyn portable_pty::MasterPty>);
+struct SendableMaster(Box<dyn MasterPty>);
 unsafe impl Send for SendableMaster {}
 
-/// Live SSH session running inside an in-process PTY.
 pub struct SshSession {
-    /// Shared vt100 terminal state updated by the reader thread.
     pub parser: Arc<Mutex<vt100::Parser>>,
-    /// Write end of the PTY — keyboard bytes go here.
     pub writer: Box<dyn Write + Send>,
-    /// Set to true when the PTY reader thread reaches EOF (SSH exited).
     pub exited: Arc<AtomicBool>,
+    /// Kept alive so we can resize the PTY later
+    master: Arc<Mutex<SendableMaster>>,
+}
+
+impl std::fmt::Debug for SshSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SshSession(exited={})", self.is_exited())
+    }
 }
 
 impl SshSession {
@@ -33,19 +35,28 @@ impl SshSession {
     pub fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Relaxed)
     }
-}
 
-impl std::fmt::Debug for SshSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SshSession(exited={})", self.is_exited())
+    /// Notify the PTY and vt100 parser of a size change.
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if let Ok(m) = self.master.lock() {
+            let _ = m.0.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        self.parser.lock().unwrap().set_size(rows, cols);
     }
 }
 
-/// Spawn `ssh` inside a PTY sized to the current terminal.
-/// Returns immediately; I/O is handled on background threads.
 pub fn spawn_ssh(server: &Server, rows: u16, cols: u16) -> std::io::Result<SshSession> {
-    let pty_system = native_pty_system();
+    let rows = rows.max(1);
+    let cols = cols.max(1);
 
+    let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -55,21 +66,17 @@ pub fn spawn_ssh(server: &Server, rows: u16, cols: u16) -> std::io::Result<SshSe
         })
         .map_err(io_err)?;
 
-    // Build the ssh command
     let mut cmd = CommandBuilder::new("ssh");
     for arg in server.ssh_args() {
         cmd.arg(arg);
     }
 
-    // Spawn inside the PTY slave
     let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
-    // Close slave side in parent — the child keeps its own copy
     drop(pair.slave);
 
-    // Destructure so we can move master into the reader thread
     let reader = pair.master.try_clone_reader().map_err(io_err)?;
     let writer = pair.master.take_writer().map_err(io_err)?;
-    let master = SendableMaster(pair.master);
+    let master = Arc::new(Mutex::new(SendableMaster(pair.master)));
 
     let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
     let exited = Arc::new(AtomicBool::new(false));
@@ -78,8 +85,8 @@ pub fn spawn_ssh(server: &Server, rows: u16, cols: u16) -> std::io::Result<SshSe
     {
         let parser = parser.clone();
         let exited = exited.clone();
+        let _master = master.clone(); // keep master alive until EOF
         thread::spawn(move || {
-            let _master = master; // keep PTY master alive until EOF
             let mut reader = reader;
             let mut buf = vec![0u8; 4096];
             loop {
@@ -104,6 +111,7 @@ pub fn spawn_ssh(server: &Server, rows: u16, cols: u16) -> std::io::Result<SshSe
         parser,
         writer,
         exited,
+        master,
     })
 }
 

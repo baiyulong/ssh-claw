@@ -69,19 +69,25 @@ fn main() -> io::Result<()> {
                         input::handle_key(&mut app, key);
                     }
                 }
-                // Let ratatui handle resize automatically on next draw
-                Event::Resize(_, _) => {}
+                Event::Resize(w, h) => {
+                    if let Screen::SshSession(ref session) = app.screen {
+                        let (pty_rows, pty_cols) =
+                            ui::ssh_inner_size(ratatui::layout::Size { width: w, height: h });
+                        session.resize(pty_rows, pty_cols);
+                    }
+                }
                 _ => {}
             }
         }
 
-        // Spawn an embedded SSH session when requested
+        // Spawn an embedded SSH session sized to the middle pane
         if let Some(idx) = app.should_ssh.take() {
             if let Some(server) = app.servers.get(idx).cloned() {
-                let size = terminal.size()?;
-                match ssh::spawn_ssh(&server, size.height, size.width) {
+                let total = terminal.size()?;
+                let (pty_rows, pty_cols) = ui::ssh_inner_size(total);
+                match ssh::spawn_ssh(&server, pty_rows, pty_cols) {
                     Ok(session) => {
-                        app.status_msg = format!("Connected → {}", server.display_connection());
+                        app.status_msg = server.display_connection();
                         app.screen = Screen::SshSession(session);
                     }
                     Err(e) => {

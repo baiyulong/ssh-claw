@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -10,12 +10,6 @@ use crate::app::{App, Screen, FORM_FIELDS};
 use crate::ssh::SshSession;
 
 pub fn draw(f: &mut Frame, app: &App) {
-    // SSH session takes over the entire frame — no chrome
-    if let Screen::SshSession(session) = &app.screen {
-        draw_ssh_session(f, session);
-        return;
-    }
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -25,22 +19,91 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    draw_header(f, chunks[0]);
-    draw_server_list(f, chunks[1], app);
-    draw_status_bar(f, chunks[2], app);
-
-    // Overlays
     match &app.screen {
-        Screen::AddForm => draw_form(f, app, "Add Server"),
-        Screen::EditForm(_) => draw_form(f, app, "Edit Server"),
-        Screen::ConfirmDelete(idx) => draw_confirm_delete(f, app, *idx),
-        Screen::Dashboard | Screen::SshSession(_) => {}
+        Screen::SshSession(session) => {
+            draw_header_ssh(f, chunks[0], &app.status_msg);
+            draw_ssh_pane(f, chunks[1], session, &app.status_msg);
+            draw_status_bar_ssh(f, chunks[2]);
+        }
+        _ => {
+            draw_header(f, chunks[0]);
+            draw_server_list(f, chunks[1], app);
+            draw_status_bar(f, chunks[2], app);
+
+            match &app.screen {
+                Screen::AddForm => draw_form(f, app, "Add Server"),
+                Screen::EditForm(_) => draw_form(f, app, "Edit Server"),
+                Screen::ConfirmDelete(idx) => draw_confirm_delete(f, app, *idx),
+                _ => {}
+            }
+        }
     }
 }
 
-/// Render the vt100 terminal grid, cell by cell, grouping spans by style.
-fn draw_ssh_session(f: &mut Frame, session: &SshSession) {
-    let area = f.area();
+/// Returns the inner rect that the SSH terminal should fill.
+/// Layout: header(3) + SSH pane(min 5) + status(3)
+/// SSH pane inner = pane area minus 1-row border on each side.
+pub fn ssh_inner_size(total: ratatui::layout::Size) -> (u16, u16) {
+    let rows = total.height.saturating_sub(3 + 3 + 2).max(1); // header + status + top/bot border
+    let cols = total.width.saturating_sub(2).max(1); // left + right border
+    (rows, cols)
+}
+
+
+fn draw_header_ssh(f: &mut Frame, area: Rect, conn: &str) {
+    let text = Line::from(vec![
+        Span::styled(
+            " SSH Manager ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " │ ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            conn,
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  │ Ctrl+D: logout  Ctrl+C: interrupt ",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn draw_status_bar_ssh(f: &mut Frame, area: Rect) {
+    let line = Line::from(Span::styled(
+        " SSH session active — type normally to interact with the remote shell ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(Paragraph::new(line).block(block), area);
+}
+
+/// Draw the SSH terminal output in the middle pane.
+fn draw_ssh_pane(f: &mut Frame, area: Rect, session: &SshSession, _conn: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(Color::Green));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    render_vt100(f, inner, session);
+}
+
+/// Render the vt100 cell grid into `area`.
+fn render_vt100(f: &mut Frame, area: Rect, session: &SshSession) {
     let parser = session.parser.lock().unwrap();
     let screen = parser.screen();
 
@@ -58,7 +121,6 @@ fn draw_ssh_session(f: &mut Frame, session: &SshSession) {
         for col in 0..cols {
             let (content, style) = match screen.cell(row as u16, col as u16) {
                 Some(cell) => {
-                    // Skip the right half of wide chars — the parent cell covers them
                     if cell.is_wide_continuation() {
                         continue;
                     }
@@ -92,7 +154,7 @@ fn draw_ssh_session(f: &mut Frame, session: &SshSession) {
 
     f.render_widget(Paragraph::new(lines), area);
 
-    // Position cursor
+    // Place cursor inside the inner pane
     if !screen.hide_cursor() {
         let (crow, ccol) = screen.cursor_position();
         let x = area.x + ccol;
@@ -143,7 +205,7 @@ fn draw_header(f: &mut Frame, area: Rect) {
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(BorderType::Rounded)
         .style(Style::default().fg(Color::DarkGray));
     let para = Paragraph::new(text).block(block);
     f.render_widget(para, area);
@@ -197,7 +259,7 @@ fn draw_server_list(f: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(" Servers ")
                 .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded),
+                .border_type(BorderType::Rounded),
         )
         .highlight_style(
             Style::default()
@@ -227,7 +289,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(BorderType::Rounded)
         .style(Style::default().fg(Color::DarkGray));
     let para = Paragraph::new(line).block(block);
     f.render_widget(para, area);
@@ -240,7 +302,7 @@ fn draw_form(f: &mut Frame, app: &App, title: &str) {
     let block = Block::default()
         .title(format!(" {} ", title))
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(BorderType::Rounded)
         .style(Style::default().fg(Color::Cyan));
 
     let inner = block.inner(area);
@@ -282,7 +344,7 @@ fn draw_form(f: &mut Frame, app: &App, title: &str) {
         let value = app.form.get_field(*field);
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_type(BorderType::Rounded)
             .style(if is_focused {
                 Style::default().fg(Color::Cyan)
             } else {
@@ -339,7 +401,7 @@ fn draw_confirm_delete(f: &mut Frame, app: &App, idx: usize) {
     let block = Block::default()
         .title(" Confirm Delete ")
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(BorderType::Rounded)
         .style(Style::default().fg(Color::Red));
 
     let para = Paragraph::new(text)
