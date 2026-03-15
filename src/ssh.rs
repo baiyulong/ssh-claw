@@ -101,11 +101,15 @@ pub fn spawn_ssh(server: &Server, rows: u16, cols: u16) -> std::io::Result<SshSe
         });
     }
 
-    // Reaper thread: wait for child to avoid zombie
-    thread::spawn(move || {
-        let mut child = child;
-        let _ = child.wait();
-    });
+    // Reaper thread: wait for child; this is the definitive signal that SSH has exited
+    {
+        let exited = exited.clone();
+        thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+            exited.store(true, Ordering::Relaxed);
+        });
+    }
 
     Ok(SshSession {
         parser,

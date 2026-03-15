@@ -59,9 +59,19 @@ fn main() -> io::Result<()> {
     let mut app = App::new(config_path);
 
     loop {
+        // Check SSH exit first — before drawing or handling new events
+        let ssh_ended = match &app.screen {
+            Screen::SshSession(s) => s.is_exited(),
+            _ => false,
+        };
+        if ssh_ended {
+            app.screen = Screen::Dashboard;
+            app.status_msg = "SSH session ended. Press any key.".to_string();
+        }
+
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        // Poll with a short timeout so we can check SSH exit between frames
+        // Poll with a short timeout so we detect SSH exit promptly
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -95,16 +105,6 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-        }
-
-        // Return to dashboard when SSH session ends
-        let ssh_ended = match &app.screen {
-            Screen::SshSession(s) => s.is_exited(),
-            _ => false,
-        };
-        if ssh_ended {
-            app.screen = Screen::Dashboard;
-            app.status_msg = "SSH session ended.".to_string();
         }
 
         if app.should_quit {

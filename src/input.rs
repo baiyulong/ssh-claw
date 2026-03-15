@@ -64,8 +64,15 @@ fn handle_confirm_delete(app: &mut App, key: KeyEvent, idx: usize) {
 }
 
 /// Forward every key as raw terminal bytes to the PTY writer.
+/// If the session has already exited, any keypress returns to the dashboard.
 fn handle_ssh_session(app: &mut App, key: KeyEvent) {
     if let Screen::SshSession(ref mut session) = app.screen {
+        if session.is_exited() {
+            // Session ended — any key returns to the server list
+            app.screen = Screen::Dashboard;
+            app.status_msg = "SSH session ended.".to_string();
+            return;
+        }
         let bytes = key_to_bytes(key);
         if !bytes.is_empty() {
             let _ = session.write_bytes(&bytes);
